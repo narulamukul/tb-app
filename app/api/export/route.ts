@@ -31,7 +31,7 @@ export async function POST(req: NextRequest){
   const { api, accounts, id, secret } = zohoClientFor(region);
   const { rows } = await pool.query('select * from zoho_connections where region_key=$1 limit 1', [region]);
   if(!rows.length) return NextResponse.json({ error: 'not connected'}, { status: 400 });
-  const rt = open(Buffer.from(rows[0].refresh_token_enc).toString('utf8'));
+  const rt = unseal(Buffer.from(rows[0].refresh_token_enc).toString('utf8'));
   const tok = await refreshAccessToken(accounts, id!, secret!, rt);
   const at = tok.access_token;
   const { buf, mime } = await downloadTB(api, orgId, at, from, to, fmt);
