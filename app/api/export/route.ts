@@ -1,6 +1,7 @@
 export const runtime = 'nodejs';
 
 import { NextResponse } from 'next/server';
+import { Readable } from 'node:stream';
 import { pool } from '@/lib/db';
 import { zohoClientFor } from '@/lib/zoho';
 import { unseal } from '@/lib/crypto';
@@ -18,22 +19,21 @@ export async function POST(req: Request) {
       return json(false, { error: 'Missing inputs (region/orgId/from/to)' }, 400);
     }
     const REGION = String(region).toUpperCase();
-    if (!['IN','US','EU','UK'].includes(REGION)) {
+    if (!['IN', 'US', 'EU', 'UK'].includes(REGION)) {
       return json(false, { error: `Bad region: ${REGION}` }, 400);
     }
-    // Accept only YYYY-MM-DD (Zoho is picky)
     if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
       return json(false, { error: 'Dates must be YYYY-MM-DD' }, 400);
     }
 
-    // 2) For now we use a fixed user (same as callback)
+    // 2) Use same user as the callback (hard-coded until auth is wired)
     const USER_EMAIL = 'owner@ultrahuman.com';
 
-    // 3) Load sealed refresh token
+    // 3) Load the sealed refresh token
     const row = await pool.query(
       `select refresh_token_enc from zoho_connections
-        where user_email = $1 and region_key = $2
-        limit 1`,
+         where user_email = $1 and region_key = $2
+         limit 1`,
       [USER_EMAIL, REGION]
     );
     if (row.rowCount === 0) {
@@ -64,17 +64,17 @@ export async function POST(req: Request) {
     }
     const accessToken = tokenJson.access_token as string;
 
-    // 5) Trial Balance export — try BOTH known parameter styles
+    // 5) Trial Balance export — try both known parameter styles
     const authHeader = { Authorization: `Zoho-oauthtoken ${accessToken}` };
 
-    // Style A: from_date/to_date + export_type (xlsx/pdf)
+    // A) from_date/to_date + export_type (xlsx/pdf)
     const urlA =
       `${api}/books/v3/reports/trialbalance` +
       `?organization_id=${encodeURIComponent(orgId)}` +
       `&from_date=${from}&to_date=${to}` +
       `&export_type=${fmt === 'xlsx' ? 'xlsx' : 'pdf'}`;
 
-    // Style B: from_date/to_date + export_format (xls/pdf)
+    // B) from_date/to_date + export_format (xls/pdf)
     const urlB =
       `${api}/books/v3/reports/trialbalance` +
       `?organization_id=${encodeURIComponent(orgId)}` +
@@ -82,26 +82,26 @@ export async function POST(req: Request) {
       `&export_format=${fmt === 'xlsx' ? 'xls' : 'pdf'}`;
 
     const attempts = [urlA, urlB];
-    let lastErrText = '';
     let tbRes: Response | null = null;
+    let lastErr = '';
 
     for (const u of attempts) {
       const r = await fetch(u, { headers: authHeader });
       if (r.ok) { tbRes = r; break; }
-      lastErrText = await r.text().catch(() => '');
+      lastErr = await r.text().catch(() => '');
     }
 
     if (!tbRes) {
       return json(false, {
         error: 'Zoho TB export failed (all variants)',
-        detail: lastErrText?.slice(0, 1200),
-        tried: { urlA, urlB }
+        detail: lastErr?.slice(0, 1200),
+        tried: { urlA, urlB },
       }, 400);
     }
 
     const blob = Buffer.from(await tbRes.arrayBuffer());
 
-    // 6) Upload to Google Drive (service account)
+    // 6) Upload to Google Drive (service account) — stream body (no Buffer)
     const { google } = await import('googleapis');
     const sa = JSON.parse(String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}'));
 
@@ -115,14 +115,17 @@ export async function POST(req: Request) {
     const parent = String(process.env.GOOGLE_DRIVE_PARENT_ID || '');
     if (!parent) return json(false, { error: 'Missing GOOGLE_DRIVE_PARENT_ID' }, 500);
 
-    const fileName = `TB_${REGION}_${from.slice(0,7)}.${fmt}`;
+    const fileName = `TB_${REGION}_${from.slice(0, 7)}.${fmt}`;
     const mime = fmt === 'xlsx'
       ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
       : 'application/pdf';
 
+    // Convert Buffer -> Readable stream (googleapis expects a stream for media.body)
+    const stream = Readable.from(blob);
+
     const g = await drive.files.create({
       requestBody: { name: fileName, parents: [parent] },
-      media: { mimeType: mime, body: Buffer.from(blob) as any },
+      media: { mimeType: mime, body: stream },
       fields: 'id, name',
     } as any);
 
