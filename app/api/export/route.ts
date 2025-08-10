@@ -13,7 +13,7 @@ export async function POST(req: Request) {
   try {
     const { region, orgId, from, to, fmt = 'xlsx' } = await req.json();
 
-    // 1) Basic input checks
+    // 1) Validate inputs
     if (!region || !orgId || !from || !to) {
       return json(false, { error: 'Missing inputs (region/orgId/from/to)' }, 400);
     }
@@ -21,8 +21,12 @@ export async function POST(req: Request) {
     if (!['IN','US','EU','UK'].includes(REGION)) {
       return json(false, { error: `Bad region: ${REGION}` }, 400);
     }
+    // Accept only YYYY-MM-DD (Zoho is picky)
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) {
+      return json(false, { error: 'Dates must be YYYY-MM-DD' }, 400);
+    }
 
-    // 2) Use same email as callback (hard-coded for now)
+    // 2) For now we use a fixed user (same as callback)
     const USER_EMAIL = 'owner@ultrahuman.com';
 
     // 3) Load sealed refresh token
@@ -35,7 +39,6 @@ export async function POST(req: Request) {
     if (row.rowCount === 0) {
       return json(false, { error: `No Zoho connection found for ${REGION}. Click "Connect Zoho" first.` }, 400);
     }
-
     const raw = row.rows[0].refresh_token_enc as any;
     const sealed =
       typeof raw === 'string' ? raw :
@@ -43,7 +46,7 @@ export async function POST(req: Request) {
       String(raw);
     const refreshToken = unseal(sealed);
 
-    // 4) Exchange refresh -> access token
+    // 4) Refresh -> access token
     const { accounts, api, id, secret } = zohoClientFor(REGION as any);
     const tokenRes = await fetch(`${accounts}/oauth/v2/token`, {
       method: 'POST',
@@ -61,20 +64,44 @@ export async function POST(req: Request) {
     }
     const accessToken = tokenJson.access_token as string;
 
-    // 5) Fetch Trial Balance from Zoho
-    const exportUrl =
-      `${api}/books/v3/reports/trialbalance?organization_id=${encodeURIComponent(orgId)}` +
-      `&date_from=${from}&date_to=${to}&export_type=${fmt}`;
-    const tbRes = await fetch(exportUrl, {
-      headers: { Authorization: `Zoho-oauthtoken ${accessToken}` },
-    });
-    if (!tbRes.ok) {
-      const text = await tbRes.text().catch(() => '');
-      return json(false, { error: `Zoho TB export failed: ${tbRes.status}`, detail: text.slice(0, 4000) }, 502);
+    // 5) Trial Balance export — try BOTH known parameter styles
+    const authHeader = { Authorization: `Zoho-oauthtoken ${accessToken}` };
+
+    // Style A: from_date/to_date + export_type (xlsx/pdf)
+    const urlA =
+      `${api}/books/v3/reports/trialbalance` +
+      `?organization_id=${encodeURIComponent(orgId)}` +
+      `&from_date=${from}&to_date=${to}` +
+      `&export_type=${fmt === 'xlsx' ? 'xlsx' : 'pdf'}`;
+
+    // Style B: from_date/to_date + export_format (xls/pdf)
+    const urlB =
+      `${api}/books/v3/reports/trialbalance` +
+      `?organization_id=${encodeURIComponent(orgId)}` +
+      `&from_date=${from}&to_date=${to}` +
+      `&export_format=${fmt === 'xlsx' ? 'xls' : 'pdf'}`;
+
+    const attempts = [urlA, urlB];
+    let lastErrText = '';
+    let tbRes: Response | null = null;
+
+    for (const u of attempts) {
+      const r = await fetch(u, { headers: authHeader });
+      if (r.ok) { tbRes = r; break; }
+      lastErrText = await r.text().catch(() => '');
     }
+
+    if (!tbRes) {
+      return json(false, {
+        error: 'Zoho TB export failed (all variants)',
+        detail: lastErrText?.slice(0, 1200),
+        tried: { urlA, urlB }
+      }, 400);
+    }
+
     const blob = Buffer.from(await tbRes.arrayBuffer());
 
-    // 6) Upload to Google Drive (service account) – use new JWT(options) form
+    // 6) Upload to Google Drive (service account)
     const { google } = await import('googleapis');
     const sa = JSON.parse(String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}'));
 
@@ -85,7 +112,6 @@ export async function POST(req: Request) {
     });
 
     const drive = google.drive({ version: 'v3', auth });
-
     const parent = String(process.env.GOOGLE_DRIVE_PARENT_ID || '');
     if (!parent) return json(false, { error: 'Missing GOOGLE_DRIVE_PARENT_ID' }, 500);
 
@@ -96,7 +122,6 @@ export async function POST(req: Request) {
 
     const g = await drive.files.create({
       requestBody: { name: fileName, parents: [parent] },
-      // TS type expects a stream; Buffer works at runtime, so cast to any
       media: { mimeType: mime, body: Buffer.from(blob) as any },
       fields: 'id, name',
     } as any);
