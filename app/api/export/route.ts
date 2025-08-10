@@ -36,7 +36,6 @@ export async function POST(req: Request) {
       return json(false, { error: `No Zoho connection found for ${REGION}. Click "Connect Zoho" first.` }, 400);
     }
 
-    // Robustly read sealed token (TEXT or bytea)
     const raw = row.rows[0].refresh_token_enc as any;
     const sealed =
       typeof raw === 'string' ? raw :
@@ -75,15 +74,16 @@ export async function POST(req: Request) {
     }
     const blob = Buffer.from(await tbRes.arrayBuffer());
 
-    // 6) Upload to Google Drive (service account)
+    // 6) Upload to Google Drive (service account) – use new JWT(options) form
     const { google } = await import('googleapis');
     const sa = JSON.parse(String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}'));
-    const auth = new google.auth.JWT(
-      sa.client_email,
-      undefined,
-      sa.private_key,
-      ['https://www.googleapis.com/auth/drive.file']
-    );
+
+    const auth = new google.auth.JWT({
+      email: sa.client_email,
+      key: sa.private_key,
+      scopes: ['https://www.googleapis.com/auth/drive.file'],
+    });
+
     const drive = google.drive({ version: 'v3', auth });
 
     const parent = String(process.env.GOOGLE_DRIVE_PARENT_ID || '');
@@ -94,9 +94,9 @@ export async function POST(req: Request) {
       ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
       : 'application/pdf';
 
-    // googleapis accepts a stream; Buffer works if wrapped as any
     const g = await drive.files.create({
       requestBody: { name: fileName, parents: [parent] },
+      // TS type expects a stream; Buffer works at runtime, so cast to any
       media: { mimeType: mime, body: Buffer.from(blob) as any },
       fields: 'id, name',
     } as any);
