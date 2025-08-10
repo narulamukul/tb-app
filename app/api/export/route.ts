@@ -122,12 +122,13 @@ export async function POST(req: Request) {
 
     // Convert Buffer -> Readable stream (googleapis expects a stream for media.body)
     const stream = Readable.from(blob);
+const g = await drive.files.create({
+  requestBody: { name: fileName, parents: [parent] },
+  media: { mimeType: mime, body: stream },   // stream = Readable.from(blob)
+  fields: 'id, name, parents',
+  supportsAllDrives: true,                   // <-- important for Shared drives
+} as any);
 
-    const g = await drive.files.create({
-      requestBody: { name: fileName, parents: [parent] },
-      media: { mimeType: mime, body: stream },
-      fields: 'id, name',
-    } as any);
 
     return json(true, { driveFileId: g.data.id, driveFileName: g.data.name });
   } catch (e: any) {
