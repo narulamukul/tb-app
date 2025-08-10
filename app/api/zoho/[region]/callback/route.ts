@@ -51,5 +51,6 @@ export async function GET(req: Request, { params }: any) {
     ]
   );
 
-  return NextResponse.redirect(`${process.env.NEXTAUTH_URL}/dashboard?connected=${region}`);
+  return NextResponse.redirect(`${process.env.NEXTAUTH_URL}/?connected=${region}`);
+
 }
