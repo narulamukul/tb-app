@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { pool } from '@/lib/db';
 import { uploadToDrive } from '@/lib/drive';
-import { open } from '@/lib/crypto';
+import { unseal } from '@/lib/crypto';
 import { zohoClientFor } from '@/lib/zoho';
 
 async function refreshAccessToken(accounts: string, client_id: string, client_secret: string, refresh_token: string){
