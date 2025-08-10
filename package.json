@@ -17,7 +17,9 @@
 "googleapis": "latest",
 "bullmq": "latest",
 "ioredis": "latest",
-"axios": "latest"
+"axios": "latest",
+    "pg": "^8.11.5"
+
 
   },
   "devDependencies": {
