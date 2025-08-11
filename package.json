@@ -19,7 +19,7 @@
 "ioredis": "latest",
 "axios": "latest",
     "pg": "^8.11.5",
-    "xlsx": "^0.18.5"
+    "xlsx": "^0.20.2"
 
 
   },
