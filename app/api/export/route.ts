@@ -1,3 +1,4 @@
+// app/api/export/route.ts
 export const runtime = 'nodejs';
 
 import { NextResponse } from 'next/server';
@@ -5,6 +6,8 @@ import { Readable } from 'node:stream';
 import { pool } from '@/lib/db';
 import { zohoClientFor } from '@/lib/zoho';
 import { unseal } from '@/lib/crypto';
+
+/* ----------------------- small helpers ----------------------- */
 
 function json(ok: boolean, body: any, status = 200) {
   return NextResponse.json({ ok, ...body }, { status });
@@ -51,50 +54,79 @@ function guessExtMime(buf: Buffer, contentType?: string | null, contentDisp?: st
   return { ext: 'json', mime: 'application/json' };
 }
 
-// Try to find a table-like array of objects inside Zoho's JSON
-function extractTablesFromZoho(json: any): Array<{name: string, rows: any[]}> {
-  const tables: Array<{name: string, rows: any[]}> = [];
+/* ----- JSON → tables (deep search, flatten nested fields) ----- */
 
-  // Direct array of objects
-  if (Array.isArray(json) && json.length && typeof json[0] === 'object') {
-    tables.push({ name: 'Sheet1', rows: json });
-    return tables;
+type Table = { name: string; rows: any[]; size: number };
+
+// flatten nested objects into dot.notation columns
+function flattenRow(obj: any, prefix = '', out: Record<string, any> = {}, depth = 0): Record<string, any> {
+  if (obj === null || obj === undefined) return out;
+  if (typeof obj !== 'object' || depth > 4) { // cap depth
+    out[prefix || 'value'] = obj;
+    return out;
   }
-
-  // Common keys to look for
-  const keys = ['trialbalance', 'trial_balance', 'data', 'rows', 'report', 'result', 'items', 'records'];
-  for (const k of Object.keys(json)) {
-    const v = (json as any)[k];
-    if (Array.isArray(v) && v.length && typeof v[0] === 'object') {
-      tables.push({ name: k.slice(0, 31), rows: v });
-    } else if (v && typeof v === 'object') {
-      // look one level deeper
-      for (const kk of keys) {
-        const vv = (v as any)[kk];
-        if (Array.isArray(vv) && vv.length && typeof vv[0] === 'object') {
-          tables.push({ name: `${k}_${kk}`.slice(0, 31), rows: vv });
-        }
-      }
+  if (Array.isArray(obj)) {
+    // simple arrays → join; arrays of objects → JSON string
+    if (obj.every(v => v === null || typeof v !== 'object')) {
+      out[prefix || 'value'] = obj.join('; ');
+    } else {
+      out[prefix || 'value'] = JSON.stringify(obj);
     }
+    return out;
   }
-
-  // As a last resort, if we see {columns:[..], rows:[[..]]}, map columns -> objects
-  const cols = (json?.columns || json?.report?.columns || json?.table?.columns) as any[];
-  const rws  = (json?.rows    || json?.report?.rows    || json?.table?.rows) as any[];
-  if (Array.isArray(cols) && Array.isArray(rws) && cols.length && rws.length) {
-    const headers = cols.map((c: any) => (c?.name || c?.label || c)?.toString?.() || 'col');
-    const mapped = rws
-      .filter((row: any) => Array.isArray(row))
-      .map((row: any[]) => Object.fromEntries(headers.map((h: string, i: number) => [h, row[i]])));
-    if (mapped.length) tables.push({ name: 'Report', rows: mapped });
+  for (const [k, v] of Object.entries(obj)) {
+    const key = prefix ? `${prefix}.${k}` : k;
+    if (v && typeof v === 'object') flattenRow(v, key, out, depth + 1);
+    else out[key] = v;
   }
-
-  return tables;
+  return out;
 }
+
+// recursively collect ALL arrays-of-objects with their JSON path
+function collectTablesDeep(node: any, path = 'root', out: Table[] = []): Table[] {
+  if (!node) return out;
+
+  if (Array.isArray(node)) {
+    if (node.length && typeof node[0] === 'object' && !Array.isArray(node[0])) {
+      const rows = node.map(r => flattenRow(r));
+      out.push({ name: path.slice(-64), rows, size: rows.length });
+    }
+    node.forEach((v, i) => collectTablesDeep(v, `${path}[${i}]`, out));
+    return out;
+  }
+  if (typeof node === 'object') {
+    for (const [k, v] of Object.entries(node)) collectTablesDeep(v, `${path}.${k}`, out);
+  }
+  return out;
+}
+
+// prefer the largest / most “TB-looking” arrays first
+function extractTablesFromZohoDeep(json: any): Table[] {
+  const all = collectTablesDeep(json, 'root');
+  const score = (t: Table) => {
+    const p = t.name.toLowerCase();
+    let s = t.size;
+    if (p.includes('trial') || p.includes('tb')) s += 10000;
+    if (p.includes('.values'))                 s += 5000;
+    if (p.includes('rows') || p.includes('records') || p.includes('items')) s += 2000;
+    return s;
+  };
+  all.sort((a, b) => score(b) - score(a));
+
+  // prettify sheet names
+  return all.map((t, i) => {
+    let name = t.name.split('.').slice(-1)[0] || `Sheet${i + 1}`;
+    name = name.replace(/\[.*?\]/g, '').replace(/[^A-Za-z0-9 _-]/g, '').trim();
+    if (!name) name = `Sheet${i + 1}`;
+    return { ...t, name: name.slice(0, 31) };
+  });
+}
+
+/* ---------------------------- handler ---------------------------- */
 
 export async function POST(req: Request) {
   try {
-    const { region, orgId, from, to, fmt = 'xlsx' } = await req.json();
+    const { region, orgId, from, to } = await req.json();
 
     if (!region || !orgId || !from || !to) return json(false, { error: 'Missing inputs (region/orgId/from/to)' }, 400);
     const REGION = String(region).toUpperCase();
@@ -106,18 +138,19 @@ export async function POST(req: Request) {
     // single-user for now
     const USER_EMAIL = 'owner@ultrahuman.com';
 
-    // get refresh token
+    // load sealed refresh token
     const row = await pool.query(
       `select refresh_token_enc from zoho_connections
        where user_email=$1 and region_key=$2 limit 1`,
       [USER_EMAIL, REGION]
     );
     if (!row.rowCount) return json(false, { error: `No Zoho connection found for ${REGION}` }, 400);
+
     const sealedRaw = row.rows[0].refresh_token_enc as any;
     const sealed = typeof sealedRaw === 'string' ? sealedRaw : Buffer.isBuffer(sealedRaw) ? sealedRaw.toString('utf8') : String(sealedRaw);
     const refreshToken = unseal(sealed);
 
-    // refresh -> access token
+    // refresh → access token
     const { accounts, api, id, secret } = zohoClientFor(REGION as any);
     const tokenRes = await fetch(`${accounts}/oauth/v2/token`, {
       method: 'POST',
@@ -136,12 +169,12 @@ export async function POST(req: Request) {
     const accessToken = tokenJson.access_token as string;
     const headers = { Authorization: `Zoho-oauthtoken ${accessToken}` };
 
-    // Build attempts (Zoho can vary). We’ll request export first; if JSON comes back, we’ll transform.
+    // Try export endpoints first; fall back to raw JSON (no export params)
     const base = `${api}/books/v3/reports/trialbalance?organization_id=${encodeURIComponent(orgId)}&from_date=${from}&to_date=${to}`;
     const attempts: string[] = [
       `${base}&export_type=xlsx`,
       `${base}&export_format=xls`,
-      `${base}`, // plain JSON (no export param)
+      `${base}`, // often returns JSON
     ];
 
     let resp: Response | null = null, lastErr = '';
@@ -154,7 +187,7 @@ export async function POST(req: Request) {
       return json(false, { error: 'Zoho TB request failed', detail: lastErr.slice(0, 1200), tried: attempts }, 400);
     }
 
-    // Read bytes and headers
+    // Read payload & detect type
     const buf = Buffer.from(await resp.arrayBuffer());
     const ct = resp.headers.get('content-type');
     const cd = resp.headers.get('content-disposition');
@@ -165,27 +198,41 @@ export async function POST(req: Request) {
     let uploadMime = guess.mime;
     let convertedFromJson = false;
 
-    // If Zoho responded with JSON, transform to XLSX
-    if (uploadExt === 'json' || (ct && ct.includes('json')) || /^[\s\r\n]*[\{\[]/.test(buf.toString('utf8', 0, Math.min(buf.length, 64)))) {
+    // If JSON → build a proper XLSX using deep extraction
+    const looksJson =
+      uploadExt === 'json' ||
+      (ct && ct.toLowerCase().includes('json')) ||
+      /^[\s\r\n]*[\{\[]/.test(buf.toString('utf8', 0, Math.min(buf.length, 64)));
+
+    if (looksJson) {
       try {
         const text = buf.toString('utf8');
         const jsonBody = JSON.parse(text);
 
-        const tables = extractTablesFromZoho(jsonBody);
+        const tables = extractTablesFromZohoDeep(jsonBody);
         if (!tables.length) {
-          return json(false, { error: 'Zoho JSON returned but no table-like data found', previewKeys: Object.keys(jsonBody).slice(0, 20) }, 422);
+          return json(false, {
+            error: 'Zoho JSON returned but no table-like data found',
+            previewKeys: Object.keys(jsonBody).slice(0, 30),
+          }, 422);
         }
 
         const XLSXmod: any = await import('xlsx');
         const XLSX = XLSXmod?.default ?? XLSXmod;
 
         const wb = XLSX.utils.book_new();
-        for (const t of tables.slice(0, 6)) { // cap sheets to avoid huge workbooks
-          const sheet = XLSX.utils.json_to_sheet(t.rows);
-          XLSX.utils.book_append_sheet(wb, sheet, (t.name || 'Sheet').substring(0, 31));
-        }
-        uploadBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-        uploadExt = 'xlsx';
+        const TOP = tables.slice(0, 6); // cap number of sheets
+        TOP.forEach((t, idx) => {
+          const ws = XLSX.utils.json_to_sheet(t.rows);
+          let name = t.name;
+          const low = name.toLowerCase();
+          if (low.includes('values')) name = 'TrialBalance';
+          else if (low.includes('rows')) name = 'TrialBalanceRows';
+          XLSX.utils.book_append_sheet(wb, ws, (name || `Sheet${idx + 1}`).slice(0, 31));
+        });
+
+        uploadBuf  = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+        uploadExt  = 'xlsx';
         uploadMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
         convertedFromJson = true;
       } catch (e: any) {
@@ -193,7 +240,7 @@ export async function POST(req: Request) {
       }
     }
 
-    // Upload to Google Drive (Shared Drive safe)
+    // Upload to Google Drive (Shared drives OK)
     const { google } = await import('googleapis');
     const sa = JSON.parse(String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}'));
     const auth = new google.auth.JWT({
