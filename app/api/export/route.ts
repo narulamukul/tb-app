@@ -50,44 +50,100 @@ function guessExtMime(buf: Buffer, contentType?: string | null, contentDisp?: st
   return { ext: 'json', mime: 'application/json' };
 }
 
-/* ------ JSON → tables (deep search + flatten) ------ */
+/* ------ JSON → tables (deep search + flatten safely) ------ */
 
 type Table = { name: string; rows: any[]; size: number };
 
+// Excel cell limit guard
+const MAX_CELL = 32000;
+function safeCell(v: any): any {
+  if (v == null) return v;
+  if (typeof v === 'string') {
+    if (v.length > MAX_CELL) return v.slice(0, MAX_CELL) + '…(truncated)';
+    return v;
+  }
+  return v;
+}
+
+// keys that tend to be HUGE; summarize instead of dumping JSON
+const PRUNE_PATTERNS: RegExp[] = [
+  /account_transactions/i,
+  /previous_values/i,
+  /account_type_col_span_list/i,
+  /columns/i,
+  /history/i,
+  /audit/i,
+];
+function shouldSummarize(path: string): boolean {
+  return PRUNE_PATTERNS.some((re) => re.test(path));
+}
+
+// flatten nested objects into dot.notation columns, summarizing huge branches
 function flattenRow(obj: any, prefix = '', out: Record<string, any> = {}, depth = 0): Record<string, any> {
   if (obj === null || obj === undefined) return out;
-  if (typeof obj !== 'object' || depth > 4) { out[prefix || 'value'] = obj; return out; }
-  if (Array.isArray(obj)) {
-    if (obj.every(v => v === null || typeof v !== 'object')) out[prefix || 'value'] = obj.join('; ');
-    else out[prefix || 'value'] = JSON.stringify(obj);
+
+  // Avoid exploding deeply
+  if (depth > 4) {
+    out[prefix || 'value'] = '[nested object]';
     return out;
   }
+
+  if (typeof obj !== 'object') {
+    out[prefix || 'value'] = safeCell(obj);
+    return out;
+  }
+
+  if (Array.isArray(obj)) {
+    if (obj.every(v => v === null || typeof v !== 'object')) {
+      out[prefix || 'value'] = safeCell(obj.join('; '));
+    } else {
+      out[prefix || 'value'] = `[${obj.length} items]`;
+    }
+    return out;
+  }
+
   for (const [k, v] of Object.entries(obj)) {
     const key = prefix ? `${prefix}.${k}` : k;
-    if (v && typeof v === 'object') flattenRow(v, key, out, depth + 1);
-    else out[key] = v;
+    if (v && typeof v === 'object') {
+      if (shouldSummarize(key)) {
+        if (Array.isArray(v)) out[key] = `[${v.length} items]`;
+        else out[key] = '[object]';
+      } else {
+        flattenRow(v, key, out, depth + 1);
+      }
+    } else {
+      out[key] = safeCell(v);
+    }
   }
   return out;
 }
 
+// collect ALL arrays-of-objects with their JSON path
 function collectTablesDeep(node: any, path = 'root', out: Table[] = []): Table[] {
   if (!node) return out;
+
   if (Array.isArray(node)) {
     if (node.length && typeof node[0] === 'object' && !Array.isArray(node[0])) {
-      const rows = node.map(r => flattenRow(r));
+      const rows = node.map((r) => flattenRow(r));
       out.push({ name: path.slice(-64), rows, size: rows.length });
     }
     node.forEach((v, i) => collectTablesDeep(v, `${path}[${i}]`, out));
     return out;
   }
+
   if (typeof node === 'object') {
-    for (const [k, v] of Object.entries(node)) collectTablesDeep(v, `${path}.${k}`, out);
+    for (const [k, v] of Object.entries(node)) {
+      collectTablesDeep(v, `${path}.${k}`, out);
+    }
   }
+
   return out;
 }
 
 function extractTablesFromZohoDeep(json: any): Table[] {
   const all = collectTablesDeep(json, 'root');
+
+  // Prefer the largest, “TB-looking” arrays
   const score = (t: Table) => {
     const p = t.name.toLowerCase();
     let s = t.size;
@@ -96,10 +152,13 @@ function extractTablesFromZohoDeep(json: any): Table[] {
     if (p.includes('rows') || p.includes('records') || p.includes('items')) s += 2_000;
     return s;
   };
+
   all.sort((a, b) => score(b) - score(a));
+
+  // Prettify names
   return all.map((t, i) => {
     let name = t.name.split('.').slice(-1)[0] || `Sheet${i + 1}`;
-    name = name.replace(/\[.*?\]/g, '').replace(/[^A-Za-z0-9 _-]/g, '').trim();
+    name = name.replace(/\[.*?\]/g, '').replace(/[:\\/?*\[\]]/g, ' ').replace(/\s+/g, ' ').trim();
     if (!name) name = `Sheet${i + 1}`;
     return { ...t, name: name.slice(0, 31) };
   });
@@ -109,8 +168,8 @@ function extractTablesFromZohoDeep(json: any): Table[] {
 
 function sanitizeSheetName(raw: string) {
   let name = (raw || 'Sheet')
-    .replace(/\[[^\]]*\]/g, '')        // remove bracket indexes
-    .replace(/[:\\/?*\[\]]/g, ' ')     // invalid Excel chars
+    .replace(/\[[^\]]*\]/g, '')
+    .replace(/[:\\/?*\[\]]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
   if (!name) name = 'Sheet';
@@ -119,7 +178,7 @@ function sanitizeSheetName(raw: string) {
 function uniqueSheetName(seen: Set<string>, base: string) {
   let name = sanitizeSheetName(base);
   if (!seen.has(name)) { seen.add(name); return name; }
-  for (let i = 2; i < 100; i++) {
+  for (let i = 2; i < 200; i++) {
     const suffix = ` (${i})`;
     const head = name.slice(0, 31 - suffix.length);
     const candidate = head + suffix;
@@ -135,8 +194,8 @@ function uniqueSheetName(seen: Set<string>, base: string) {
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
-    const { region, orgId, from, to, debug = false } = body as {
-      region: string; orgId: string; from: string; to: string; debug?: boolean;
+    const { region, orgId, from, to } = body as {
+      region: string; orgId: string; from: string; to: string;
     };
 
     if (!region || !orgId || !from || !to) return json(false, { error: 'Missing inputs (region/orgId/from/to)' }, 400);
@@ -196,21 +255,16 @@ export async function POST(req: Request) {
     }
     if (!resp) return json(false, { error: 'Zoho TB request failed', detail: lastErr.slice(0, 1200), tried: attempts }, 400);
 
-    // read payload
+    // payload
     const buf = Buffer.from(await resp.arrayBuffer());
     const ct = resp.headers.get('content-type') || '';
     const cd = resp.headers.get('content-disposition') || '';
-    const guess = guessExtMime(buf, ct, cd);
-
-    let uploadBuf = buf;
-    let uploadExt = guess.ext;
-    let uploadMime = guess.mime;
-    let convertedFromJson = false;
+    const rawGuess = guessExtMime(buf, ct, cd);
 
     // JSON detection (with BOM-safe head check)
     const head = buf.toString('utf8', 0, Math.min(buf.length, 128));
     const looksJson =
-      uploadExt === 'json' ||
+      rawGuess.ext === 'json' ||
       ct.toLowerCase().includes('json') ||
       /^[\uFEFF\s\r\n]*[\{\[]/.test(head);
 
@@ -226,87 +280,140 @@ export async function POST(req: Request) {
     const parent = String(process.env.GOOGLE_DRIVE_PARENT_ID || '');
     if (!parent) return json(false, { error: 'Missing GOOGLE_DRIVE_PARENT_ID' }, 500);
 
+    const period = from.slice(0, 7);
+
+    /* 1) Always upload RAW */
+    const rawName = `TB_${REGION}_${period}_RAW.${rawGuess.ext}`;
+    const rawUpload = await drive.files.create({
+      requestBody: { name: rawName, parents: [parent] },
+      media: { mimeType: rawGuess.mime, body: Readable.from(buf) },
+      fields: 'id, name, mimeType, fileExtension, webViewLink',
+      supportsAllDrives: true,
+    } as any);
+
+    /* 2) Build XLSX (convert when needed) */
+    let xlsxBuf: Buffer;
+
     if (looksJson) {
+      // JSON → tables → XLSX
       const rawText = buf.toString('utf8').replace(/^\uFEFF/, '');
       let jsonBody: any;
-      try {
-        jsonBody = JSON.parse(rawText);
-      } catch (e: any) {
-        let debugFile: any = null;
-        if (debug) {
-          const dbg = await drive.files.create({
-            requestBody: { name: `TB_${REGION}_${from.slice(0,7)}_RAW.json`, parents: [parent] },
-            media: { mimeType: 'application/json', body: Readable.from(Buffer.from(rawText, 'utf8')) },
-            fields: 'id, webViewLink, name',
-            supportsAllDrives: true,
-          } as any);
-          debugFile = dbg.data;
+      try { jsonBody = JSON.parse(rawText); }
+      catch (e: any) {
+        // If parse fails, still create a minimal workbook explaining the issue
+        const XLSXmod: any = await import('xlsx');
+        const XLSX = XLSXmod?.default ?? XLSXmod;
+        const ws = XLSX.utils.aoa_to_sheet([
+          ['Zoho returned non-JSON content that looks like JSON but failed to parse.'],
+          ['Content-Type', ct],
+          ['Error', String(e?.message || e)],
+        ]);
+        const wb = XLSX.utils.book_new();
+        XLSX.utils.book_append_sheet(wb, ws, 'Info');
+        xlsxBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+      }
+
+      if (jsonBody) {
+        if (jsonBody?.code && jsonBody?.message && !jsonBody?.trialbalance && !jsonBody?.data) {
+          const XLSXmod: any = await import('xlsx');
+          const XLSX = XLSXmod?.default ?? XLSXmod;
+          const ws = XLSX.utils.aoa_to_sheet([
+            ['Zoho returned error JSON'],
+            ['code', jsonBody.code],
+            ['message', jsonBody.message],
+          ]);
+          const wb = XLSX.utils.book_new();
+          XLSX.utils.book_append_sheet(wb, ws, 'Zoho Error');
+          xlsxBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+        } else {
+          const tables = extractTablesFromZohoDeep(jsonBody);
+          const XLSXmod: any = await import('xlsx');
+          const XLSX = XLSXmod?.default ?? XLSXmod;
+          const wb = XLSX.utils.book_new();
+
+          if (!tables.length) {
+            const ws = XLSX.utils.aoa_to_sheet([
+              ['No table-like arrays found in Zoho JSON.'],
+              ['Top-level keys', Object.keys(jsonBody).slice(0, 30).join(', ')],
+            ]);
+            XLSX.utils.book_append_sheet(wb, ws, 'Info');
+          } else {
+            const seen = new Set<string>();
+            tables.slice(0, 8).forEach((t, idx) => {
+              const ws = XLSX.utils.json_to_sheet(t.rows);
+              let base = t.name || `Sheet${idx + 1}`;
+              const low = base.toLowerCase();
+              if (low.includes('values')) base = 'Trial Balance';
+              else if (low.includes('rows')) base = 'Trial Balance Rows';
+              const safe = uniqueSheetName(seen, base);
+              XLSX.utils.book_append_sheet(wb, ws, safe);
+            });
+          }
+          xlsxBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
         }
-        return json(false, { error: 'Zoho JSON parse failed', parseError: String(e?.message || e), head: rawText.slice(0, 500), contentType: ct, debugFile }, 422);
       }
-
-      if (jsonBody?.code && jsonBody?.message && !jsonBody?.trialbalance && !jsonBody?.data) {
-        return json(false, { error: 'Zoho error', zoho: { code: jsonBody.code, message: jsonBody.message } }, 400);
-      }
-
-      const tables = extractTablesFromZohoDeep(jsonBody);
-      if (!tables.length) {
-        let debugFile: any = null;
-        if (debug) {
-          const dbg = await drive.files.create({
-            requestBody: { name: `TB_${REGION}_${from.slice(0,7)}_RAW.json`, parents: [parent] },
-            media: { mimeType: 'application/json', body: Readable.from(Buffer.from(JSON.stringify(jsonBody, null, 2))) },
-            fields: 'id, webViewLink, name',
-            supportsAllDrives: true,
-          } as any);
-          debugFile = dbg.data;
-        }
-        return json(false, { error: 'Zoho JSON returned but no table-like data found', previewKeys: Object.keys(jsonBody).slice(0, 30), debugFile }, 422);
-      }
-
+    } else if (rawGuess.ext === 'xlsx') {
+      // Already XLSX
+      xlsxBuf = buf;
+    } else if (rawGuess.ext === 'xls' || rawGuess.ext === 'csv') {
+      // Convert XLS/CSV → XLSX
       const XLSXmod: any = await import('xlsx');
       const XLSX = XLSXmod?.default ?? XLSXmod;
+      const wbIn = XLSX.read(buf, { type: 'buffer' });
 
+      // enforce cell length in all sheets
+      for (const sn of wbIn.SheetNames) {
+        const ws = wbIn.Sheets[sn];
+        const range = ws['!ref'] ? XLSX.utils.decode_range(ws['!ref']) : null;
+        if (!range) continue;
+        for (let R = range.s.r; R <= range.e.r; R++) {
+          for (let C = range.s.c; C <= range.e.c; C++) {
+            const addr = XLSX.utils.encode_cell({ r: R, c: C });
+            const cell = ws[addr];
+            if (cell && typeof cell.v === 'string' && cell.v.length > MAX_CELL) {
+              cell.v = cell.v.slice(0, MAX_CELL) + '…(truncated)';
+            }
+          }
+        }
+      }
+      xlsxBuf = XLSX.write(wbIn, { type: 'buffer', bookType: 'xlsx' });
+    } else {
+      // PDF/other → create info workbook
+      const XLSXmod: any = await import('xlsx');
+      const XLSX = XLSXmod?.default ?? XLSXmod;
+      const ws = XLSX.utils.aoa_to_sheet([
+        ['Zoho returned a non-Excel format (e.g., PDF).'],
+        ['Content-Type', ct],
+        ['We saved the original as RAW; conversion to XLSX is not applicable.'],
+      ]);
       const wb = XLSX.utils.book_new();
-      const TOP = tables.slice(0, 6);
-      const seen = new Set<string>();
-
-      TOP.forEach((t, idx) => {
-        const ws = XLSX.utils.json_to_sheet(t.rows);
-        // friendly base names
-        let base = t.name || `Sheet${idx + 1}`;
-        const low = base.toLowerCase();
-        if (low.includes('values')) base = 'Trial Balance';
-        else if (low.includes('rows')) base = 'Trial Balance Rows';
-        // unique + sanitized
-        const safe = uniqueSheetName(seen, base);
-        XLSX.utils.book_append_sheet(wb, ws, safe);
-      });
-
-      uploadBuf  = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-      uploadExt  = 'xlsx';
-      uploadMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-      convertedFromJson = true;
+      XLSX.utils.book_append_sheet(wb, ws, 'Info');
+      xlsxBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
     }
 
-    const fileName = `TB_${REGION}_${from.slice(0,7)}.${uploadExt}`;
-    const stream = Readable.from(uploadBuf);
-
-    const g = await drive.files.create({
-      requestBody: { name: fileName, parents: [parent] },
-      media: { mimeType: uploadMime, body: stream },
-      fields: 'id, name, mimeType, fileExtension, webViewLink, parents',
+    const xlsxName = `TB_${REGION}_${period}.xlsx`;
+    const xlsxUpload = await drive.files.create({
+      requestBody: { name: xlsxName, parents: [parent] },
+      media: { mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', body: Readable.from(xlsxBuf) },
+      fields: 'id, name, mimeType, fileExtension, webViewLink',
       supportsAllDrives: true,
     } as any);
 
     return json(true, {
-      driveFileId: g.data.id,
-      driveFileName: g.data.name,
-      mimeType: g.data.mimeType,
-      fileExtension: g.data.fileExtension,
-      webViewLink: g.data.webViewLink,
-      detectedResponse: guess.ext,
-      convertedFromJson,
+      raw: {
+        id: rawUpload.data.id,
+        name: rawUpload.data.name,
+        mimeType: rawUpload.data.mimeType,
+        webViewLink: rawUpload.data.webViewLink,
+        ext: rawGuess.ext,
+      },
+      xlsx: {
+        id: xlsxUpload.data.id,
+        name: xlsxUpload.data.name,
+        mimeType: xlsxUpload.data.mimeType,
+        webViewLink: xlsxUpload.data.webViewLink,
+      },
+      sourceType: looksJson ? 'json' : rawGuess.ext,
     });
   } catch (e: any) {
     console.error('[export] error', e);
