@@ -7,7 +7,7 @@ import { pool } from '@/lib/db';
 import { zohoClientFor } from '@/lib/zoho';
 import { unseal } from '@/lib/crypto';
 
-/* ---------------- basic helpers ---------------- */
+/* ---------------- utilities ---------------- */
 
 function json(ok: boolean, body: any, status = 200) {
   return NextResponse.json({ ok, ...body }, { status });
@@ -16,7 +16,6 @@ function json(ok: boolean, body: any, status = 200) {
 type Guess = { ext: 'xlsx' | 'xls' | 'csv' | 'pdf' | 'json'; mime: string };
 
 function guessExtMime(buf: Buffer, contentType?: string | null, contentDisp?: string | null): Guess {
-  // filename hint
   if (contentDisp) {
     const m = /filename\*=UTF-8''([^;]+)|filename="?([^"]+)"?/i.exec(contentDisp);
     const filename = decodeURIComponent(m?.[1] || m?.[2] || '').toLowerCase();
@@ -26,7 +25,6 @@ function guessExtMime(buf: Buffer, contentType?: string | null, contentDisp?: st
     if (filename.endsWith('.pdf'))  return { ext: 'pdf',  mime: 'application/pdf' };
     if (filename.endsWith('.json')) return { ext: 'json', mime: 'application/json' };
   }
-  // content-type
   if (contentType) {
     const ct = contentType.toLowerCase();
     if (ct.includes('officedocument.spreadsheetml.sheet')) return { ext: 'xlsx', mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
@@ -35,7 +33,6 @@ function guessExtMime(buf: Buffer, contentType?: string | null, contentDisp?: st
     if (ct.includes('pdf'))                                 return { ext: 'pdf',  mime: 'application/pdf' };
     if (ct.includes('json'))                                return { ext: 'json', mime: 'application/json' };
   }
-  // magic bytes
   const b = buf;
   if (b[0] === 0x50 && b[1] === 0x4b && b[2] === 0x03 && b[3] === 0x04) {
     return { ext: 'xlsx', mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
@@ -54,14 +51,13 @@ function guessExtMime(buf: Buffer, contentType?: string | null, contentDisp?: st
 
 type Table = { name: string; rows: any[]; size: number };
 
-const MAX_CELL = 32000; // Excel limit guard
+const MAX_CELL = 32000;
 function safeCell(v: any): any {
   if (v == null) return v;
   if (typeof v === 'string') return v.length > MAX_CELL ? v.slice(0, MAX_CELL) + '…(truncated)' : v;
   return v;
 }
 
-// summarize super-large branches instead of dumping them
 const PRUNE_PATTERNS: RegExp[] = [
   /account_transactions/i,
   /previous_values/i,
@@ -71,7 +67,7 @@ const PRUNE_PATTERNS: RegExp[] = [
   /audit/i,
 ];
 function shouldSummarize(path: string) {
-  return PRUNE_PATTERNS.some((re) => re.test(path));
+  return PRUNE_PATTERNS.some(re => re.test(path));
 }
 
 function flattenRow(obj: any, prefix = '', out: Record<string, any> = {}, depth = 0): Record<string, any> {
@@ -133,7 +129,62 @@ function extractTablesFromZohoDeep(json: any): Table[] {
   });
 }
 
-/* --------- 4-column mapping (name/code/debit/credit) --------- */
+/* --------- TB-specific extraction helpers --------- */
+
+function getAtPath(o: any, path: string): any {
+  return path.split('.').reduce((acc, k) => (acc ? (acc as any)[k] : undefined), o);
+}
+function firstArrayAtPaths(obj: any, paths: string[]): any[] | undefined {
+  for (const p of paths) {
+    const v = getAtPath(obj, p);
+    if (Array.isArray(v) && v.length) return v;
+  }
+  return undefined;
+}
+function scoreRowKeys(r: any): number {
+  const flat = flattenRow(r);
+  const keys = Object.keys(flat).map(k => k.toLowerCase());
+  let s = 0;
+  if (keys.some(k => k.endsWith('name') || k.includes('account'))) s += 3;
+  if (keys.some(k => k.includes('account_code') || k.includes('accountnumber') || k.includes('account_number'))) s += 3;
+  if (keys.some(k => k.includes('debit'))) s += 2;
+  if (keys.some(k => k.includes('credit'))) s += 2;
+  return s;
+}
+function extractTrialBalanceRows(json: any): any[] {
+  const preferred = firstArrayAtPaths(json, [
+    'trialbalance.account_transactions',
+    'trial_balance.account_transactions',
+    'trial_balance.values',
+    'trialbalance.values',
+    'report.values',
+    'report.rows',
+    'values',
+  ]);
+  if (preferred) return preferred;
+
+  const candidates: any[] = [];
+  const walk = (n: any) => {
+    if (!n) return;
+    if (Array.isArray(n)) {
+      if (n.length && typeof n[0] === 'object' && !Array.isArray(n[0])) candidates.push(n);
+      n.forEach(walk);
+    } else if (typeof n === 'object') {
+      Object.values(n).forEach(walk);
+    }
+  };
+  walk(json);
+
+  if (!candidates.length) return [];
+  candidates.sort((a, b) => {
+    const sA = a.length * 10 + scoreRowKeys(a[0] || {});
+    const sB = b.length * 10 + scoreRowKeys(b[0] || {});
+    return sB - sA;
+  });
+  return candidates[0];
+}
+
+/* --------- 4-column mapping --------- */
 
 const NAME_KEYS       = ['name', 'account_name', 'account', 'accountname', 'account_name_formatted', 'ledger_name'];
 const CODE_KEYS       = ['account_code', 'code', 'accountnumber', 'account_number', 'account_id', 'accountcode', 'ledger_code'];
@@ -150,13 +201,11 @@ function toNumber(v: any): number | undefined {
 
 function pickByKeys(flat: Record<string, any>, candidates: string[]): any {
   const cand = candidates.map(c => c.toLowerCase());
-  // exact or tail match
   for (const [k, v] of Object.entries(flat)) {
     const lk = k.toLowerCase();
     if (cand.includes(lk)) return v;
     if (cand.some(c => lk.endsWith('.' + c))) return v;
   }
-  // loose contains
   for (const [k, v] of Object.entries(flat)) {
     const lk = k.toLowerCase();
     if (cand.some(c => lk.includes(c))) return v;
@@ -164,12 +213,30 @@ function pickByKeys(flat: Record<string, any>, candidates: string[]): any {
   return undefined;
 }
 
+// prefer top-level keys, then values[0], then flattened fallback
+function getFirstByKeysFromRow(row: any, keys: string[]) {
+  const primary = row?.values && Array.isArray(row.values) && row.values.length ? row.values[0] : undefined;
+  const searchObjs = [row, primary];
+  const lcKeys = keys.map(k => k.toLowerCase());
+
+  for (const obj of searchObjs) {
+    if (!obj || typeof obj !== 'object') continue;
+    for (const [k, v] of Object.entries(obj)) {
+      const lk = k.toLowerCase();
+      if (lcKeys.includes(lk) || lcKeys.some(c => lk.endsWith('.' + c) || lk.includes(c))) {
+        if (v !== '' && v !== null && v !== undefined) return v;
+      }
+    }
+  }
+  const flat = flattenRow(row);
+  return pickByKeys(flat, keys);
+}
+
 function mapRowToFourCols(anyRow: any) {
-  const flat = flattenRow(anyRow);
-  const name = pickByKeys(flat, NAME_KEYS);
-  const account_code = pickByKeys(flat, CODE_KEYS);
-  const net_debit_total  = toNumber(pickByKeys(flat, NET_DEBIT_KEYS));
-  const net_credit_total = toNumber(pickByKeys(flat, NET_CREDIT_KEYS));
+  const name             = getFirstByKeysFromRow(anyRow, NAME_KEYS);
+  const account_code     = getFirstByKeysFromRow(anyRow, CODE_KEYS);
+  const net_debit_total  = toNumber(getFirstByKeysFromRow(anyRow, NET_DEBIT_KEYS));
+  const net_credit_total = toNumber(getFirstByKeysFromRow(anyRow, NET_CREDIT_KEYS));
   return { name, account_code, net_debit_total, net_credit_total };
 }
 
@@ -182,12 +249,12 @@ export async function POST(req: Request) {
 
     if (!region || !orgId || !from || !to) return json(false, { error: 'Missing inputs (region/orgId/from/to)' }, 400);
     const REGION = String(region).toUpperCase();
-    if (!['IN','US','EU','UK'].includes(REGION)) return json(false, { error: `Bad region: ${REGION}` }, 400);
+    if (!['IN', 'US', 'EU', 'UK'].includes(REGION)) return json(false, { error: `Bad region: ${REGION}` }, 400);
     if (!/^\d{4}-\d{2}-\d{2}$/.test(from) || !/^\d{4}-\d{2}-\d{2}$/.test(to)) return json(false, { error: 'Dates must be YYYY-MM-DD' }, 400);
 
-    const USER_EMAIL = 'owner@ultrahuman.com';
+    const USER_EMAIL = 'owner@ultrahuman.com'; // adjust if needed
 
-    // get sealed refresh token
+    // 1) get sealed refresh token from DB
     const q = await pool.query(
       `select refresh_token_enc from zoho_connections
        where user_email=$1 and region_key=$2 limit 1`,
@@ -199,7 +266,7 @@ export async function POST(req: Request) {
     const sealed = typeof sealedRaw === 'string' ? sealedRaw : Buffer.isBuffer(sealedRaw) ? sealedRaw.toString('utf8') : String(sealedRaw);
     const refreshToken = unseal(sealed);
 
-    // refresh → access token
+    // 2) refresh → access token
     const { accounts, api, id, secret } = zohoClientFor(REGION as any);
     const tokenRes = await fetch(`${accounts}/oauth/v2/token`, {
       method: 'POST',
@@ -218,7 +285,7 @@ export async function POST(req: Request) {
     const accessToken = tokenJson.access_token as string;
     const headers = { Authorization: `Zoho-oauthtoken ${accessToken}` };
 
-    // build URLs (try Excel first, then JSON)
+    // 3) request TB (prefer excel, then json)
     const base = `${api}/books/v3/reports/trialbalance?organization_id=${encodeURIComponent(orgId)}&from_date=${from}&to_date=${to}`;
     const attempts: string[] = [
       `${base}&export_type=xlsx`,
@@ -234,18 +301,17 @@ export async function POST(req: Request) {
     }
     if (!resp) return json(false, { error: 'Zoho TB request failed', detail: lastErr.slice(0, 1200), tried: attempts }, 400);
 
-    // payload & detection
+    // 4) payload & detection
     const buf = Buffer.from(await resp.arrayBuffer());
     const ct = resp.headers.get('content-type') || '';
     const cd = resp.headers.get('content-disposition') || '';
     const rawGuess = guessExtMime(buf, ct, cd);
-    const head = buf.toString('utf8', 0, Math.min(buf.length, 128));
     const looksJson =
       rawGuess.ext === 'json' ||
       ct.toLowerCase().includes('json') ||
-      /^[\uFEFF\s\r\n]*[\{\[]/.test(head);
+      /^[\uFEFF\s\r\n]*[\{\[]/.test(buf.toString('utf8', 0, Math.min(buf.length, 128)));
 
-    // Google Drive auth
+    // 5) Google Drive auth
     const { google } = await import('googleapis');
     const sa = JSON.parse(String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}'));
     const auth = new google.auth.JWT({
@@ -259,7 +325,7 @@ export async function POST(req: Request) {
 
     const period = from.slice(0, 7);
 
-    /* 1) ALWAYS upload RAW Zoho response */
+    /* 6) ALWAYS upload RAW Zoho response */
     const rawName = `TB_${REGION}_${period}_RAW.${rawGuess.ext}`;
     const rawUpload = await drive.files.create({
       requestBody: { name: rawName, parents: [parent] },
@@ -268,11 +334,10 @@ export async function POST(req: Request) {
       supportsAllDrives: true,
     } as any);
 
-    /* 2) Build the final 4-column XLSX */
-    let xlsxBuf: Buffer = Buffer.alloc(0); // init to satisfy TS
+    /* 7) Build final 4-column XLSX */
+    let xlsxBuf: Buffer = Buffer.alloc(0);
 
     if (looksJson) {
-      // JSON → pick the biggest table → map to 4 columns
       let jsonBody: any;
       try {
         const rawText = buf.toString('utf8').replace(/^\uFEFF/, '');
@@ -291,7 +356,7 @@ export async function POST(req: Request) {
       }
 
       if (!xlsxBuf && jsonBody) {
-        if (jsonBody?.code && jsonBody?.message && !jsonBody?.trialbalance && !jsonBody?.data) {
+        if (jsonBody?.code && jsonBody?.message && !jsonBody?.trial_balance && !jsonBody?.trialbalance) {
           const XLSXmod: any = await import('xlsx');
           const XLSX = XLSXmod?.default ?? XLSXmod;
           const ws = XLSX.utils.aoa_to_sheet([
@@ -303,25 +368,34 @@ export async function POST(req: Request) {
           XLSX.utils.book_append_sheet(wb, ws, 'Zoho Error');
           xlsxBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
         } else {
-          const tables = extractTablesFromZohoDeep(jsonBody);
-          const rows = tables.length ? tables[0].rows : [];
+          const rows = extractTrialBalanceRows(jsonBody);
           const mapped = rows.map(mapRowToFourCols)
                             .filter(r => (r.name ?? r.account_code) != null);
 
           const XLSXmod: any = await import('xlsx');
           const XLSX = XLSXmod?.default ?? XLSXmod;
-          const header = ['name', 'account_code', 'net_debit_total', 'net_credit_total'] as const;
-          const aoa = [header as any].concat(
-            mapped.map(r => [r.name ?? '', r.account_code ?? '', r.net_debit_total ?? '', r.net_credit_total ?? ''])
-          );
-          const ws = XLSX.utils.aoa_to_sheet(aoa);
-          const wb = XLSX.utils.book_new();
-          XLSX.utils.book_append_sheet(wb, ws, 'Trial Balance');
-          xlsxBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+
+          if (!mapped.length) {
+            const ws = XLSX.utils.aoa_to_sheet([
+              ['No trial-balance-like rows found in JSON.'],
+              ['Top keys', Object.keys(jsonBody || {}).slice(0, 30).join(', ')],
+            ]);
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, 'Info');
+            xlsxBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+          } else {
+            const header = ['name', 'account_code', 'net_debit_total', 'net_credit_total'] as const;
+            const aoa = [header as any].concat(
+              mapped.map(r => [r.name ?? '', r.account_code ?? '', r.net_debit_total ?? '', r.net_credit_total ?? ''])
+            );
+            const ws = XLSX.utils.aoa_to_sheet(aoa);
+            const wb = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(wb, ws, 'Trial Balance');
+            xlsxBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+          }
         }
       }
     } else if (rawGuess.ext === 'xlsx' || rawGuess.ext === 'xls' || rawGuess.ext === 'csv') {
-      // Read sheet → objects → map to 4 columns
       const XLSXmod: any = await import('xlsx');
       const XLSX = XLSXmod?.default ?? XLSXmod;
       const wbIn = XLSX.read(buf, { type: 'buffer' });
@@ -342,7 +416,6 @@ export async function POST(req: Request) {
       XLSX.utils.book_append_sheet(wb, ws, 'Trial Balance');
       xlsxBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
     } else {
-      // PDF / other → info workbook
       const XLSXmod: any = await import('xlsx');
       const XLSX = XLSXmod?.default ?? XLSXmod;
       const ws = XLSX.utils.aoa_to_sheet([
@@ -355,7 +428,6 @@ export async function POST(req: Request) {
       xlsxBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
     }
 
-    // Final guard: ensure we always have something to upload
     if (!xlsxBuf || xlsxBuf.length === 0) {
       const XLSXmod: any = await import('xlsx');
       const XLSX = XLSXmod?.default ?? XLSXmod;
