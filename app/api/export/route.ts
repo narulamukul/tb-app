@@ -1,4 +1,3 @@
-// app/api/export/route.ts
 export const runtime = 'nodejs';
 
 import { NextResponse } from 'next/server';
@@ -7,7 +6,7 @@ import { pool } from '@/lib/db';
 import { zohoClientFor } from '@/lib/zoho';
 import { unseal } from '@/lib/crypto';
 
-/* ----------------------- small helpers ----------------------- */
+/* ---------------- helpers ---------------- */
 
 function json(ok: boolean, body: any, status = 200) {
   return NextResponse.json({ ok, ...body }, { status });
@@ -16,7 +15,6 @@ function json(ok: boolean, body: any, status = 200) {
 type Guess = { ext: 'xlsx' | 'xls' | 'csv' | 'pdf' | 'json'; mime: string };
 
 function guessExtMime(buf: Buffer, contentType?: string | null, contentDisp?: string | null): Guess {
-  // 1) filename hint
   if (contentDisp) {
     const m = /filename\*=UTF-8''([^;]+)|filename="?([^"]+)"?/i.exec(contentDisp);
     const filename = decodeURIComponent(m?.[1] || m?.[2] || '').toLowerCase();
@@ -26,7 +24,6 @@ function guessExtMime(buf: Buffer, contentType?: string | null, contentDisp?: st
     if (filename.endsWith('.pdf'))  return { ext: 'pdf',  mime: 'application/pdf' };
     if (filename.endsWith('.json')) return { ext: 'json', mime: 'application/json' };
   }
-  // 2) content-type
   if (contentType) {
     const ct = contentType.toLowerCase();
     if (ct.includes('officedocument.spreadsheetml.sheet')) return { ext: 'xlsx', mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
@@ -35,43 +32,29 @@ function guessExtMime(buf: Buffer, contentType?: string | null, contentDisp?: st
     if (ct.includes('pdf'))                                 return { ext: 'pdf',  mime: 'application/pdf' };
     if (ct.includes('json'))                                return { ext: 'json', mime: 'application/json' };
   }
-  // 3) magic bytes
   const b = buf;
-  // XLSX is ZIP: 50 4B 03 04
   if (b[0] === 0x50 && b[1] === 0x4b && b[2] === 0x03 && b[3] === 0x04) {
     return { ext: 'xlsx', mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
   }
-  // Legacy XLS (OLE): D0 CF 11 E0 A1 B1 1A E1
-  if (b[0] === 0xd0 && b[1] === 0xcf && b[2] === 0x11 && b[3] === 0xe0 &&
-      b[4] === 0xa1 && b[5] === 0xb1 && b[6] === 0x1a && b[7] === 0xe1) {
+  if (b[0] === 0xd0 && b[1] === 0xcf && b[2] === 0x11 && b[3] === 0xe0 && b[4] === 0xa1 && b[5] === 0xb1 && b[6] === 0x1a && b[7] === 0xe1) {
     return { ext: 'xls', mime: 'application/vnd.ms-excel' };
   }
-  // PDF: %PDF
   if (b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46) {
     return { ext: 'pdf', mime: 'application/pdf' };
   }
-  // Fallback
   return { ext: 'json', mime: 'application/json' };
 }
 
-/* ----- JSON → tables (deep search, flatten nested fields) ----- */
+/* ---- deep JSON → tables with flattening ---- */
 
 type Table = { name: string; rows: any[]; size: number };
 
-// flatten nested objects into dot.notation columns
 function flattenRow(obj: any, prefix = '', out: Record<string, any> = {}, depth = 0): Record<string, any> {
   if (obj === null || obj === undefined) return out;
-  if (typeof obj !== 'object' || depth > 4) { // cap depth
-    out[prefix || 'value'] = obj;
-    return out;
-  }
+  if (typeof obj !== 'object' || depth > 4) { out[prefix || 'value'] = obj; return out; }
   if (Array.isArray(obj)) {
-    // simple arrays → join; arrays of objects → JSON string
-    if (obj.every(v => v === null || typeof v !== 'object')) {
-      out[prefix || 'value'] = obj.join('; ');
-    } else {
-      out[prefix || 'value'] = JSON.stringify(obj);
-    }
+    if (obj.every(v => v === null || typeof v !== 'object')) out[prefix || 'value'] = obj.join('; ');
+    else out[prefix || 'value'] = JSON.stringify(obj);
     return out;
   }
   for (const [k, v] of Object.entries(obj)) {
@@ -82,10 +65,8 @@ function flattenRow(obj: any, prefix = '', out: Record<string, any> = {}, depth 
   return out;
 }
 
-// recursively collect ALL arrays-of-objects with their JSON path
 function collectTablesDeep(node: any, path = 'root', out: Table[] = []): Table[] {
   if (!node) return out;
-
   if (Array.isArray(node)) {
     if (node.length && typeof node[0] === 'object' && !Array.isArray(node[0])) {
       const rows = node.map(r => flattenRow(r));
@@ -100,20 +81,17 @@ function collectTablesDeep(node: any, path = 'root', out: Table[] = []): Table[]
   return out;
 }
 
-// prefer the largest / most “TB-looking” arrays first
 function extractTablesFromZohoDeep(json: any): Table[] {
   const all = collectTablesDeep(json, 'root');
   const score = (t: Table) => {
     const p = t.name.toLowerCase();
     let s = t.size;
-    if (p.includes('trial') || p.includes('tb')) s += 10000;
-    if (p.includes('.values'))                 s += 5000;
-    if (p.includes('rows') || p.includes('records') || p.includes('items')) s += 2000;
+    if (p.includes('trial') || p.includes('tb')) s += 10_000;
+    if (p.includes('.values'))                 s += 5_000;
+    if (p.includes('rows') || p.includes('records') || p.includes('items')) s += 2_000;
     return s;
   };
   all.sort((a, b) => score(b) - score(a));
-
-  // prettify sheet names
   return all.map((t, i) => {
     let name = t.name.split('.').slice(-1)[0] || `Sheet${i + 1}`;
     name = name.replace(/\[.*?\]/g, '').replace(/[^A-Za-z0-9 _-]/g, '').trim();
@@ -122,11 +100,14 @@ function extractTablesFromZohoDeep(json: any): Table[] {
   });
 }
 
-/* ---------------------------- handler ---------------------------- */
+/* --------------------- handler --------------------- */
 
 export async function POST(req: Request) {
   try {
-    const { region, orgId, from, to } = await req.json();
+    const body = await req.json().catch(() => ({}));
+    const { region, orgId, from, to, debug = false } = body as {
+      region: string; orgId: string; from: string; to: string; debug?: boolean;
+    };
 
     if (!region || !orgId || !from || !to) return json(false, { error: 'Missing inputs (region/orgId/from/to)' }, 400);
     const REGION = String(region).toUpperCase();
@@ -135,10 +116,8 @@ export async function POST(req: Request) {
       return json(false, { error: 'Dates must be YYYY-MM-DD' }, 400);
     }
 
-    // single-user for now
     const USER_EMAIL = 'owner@ultrahuman.com';
 
-    // load sealed refresh token
     const row = await pool.query(
       `select refresh_token_enc from zoho_connections
        where user_email=$1 and region_key=$2 limit 1`,
@@ -150,7 +129,6 @@ export async function POST(req: Request) {
     const sealed = typeof sealedRaw === 'string' ? sealedRaw : Buffer.isBuffer(sealedRaw) ? sealedRaw.toString('utf8') : String(sealedRaw);
     const refreshToken = unseal(sealed);
 
-    // refresh → access token
     const { accounts, api, id, secret } = zohoClientFor(REGION as any);
     const tokenRes = await fetch(`${accounts}/oauth/v2/token`, {
       method: 'POST',
@@ -169,12 +147,11 @@ export async function POST(req: Request) {
     const accessToken = tokenJson.access_token as string;
     const headers = { Authorization: `Zoho-oauthtoken ${accessToken}` };
 
-    // Try export endpoints first; fall back to raw JSON (no export params)
     const base = `${api}/books/v3/reports/trialbalance?organization_id=${encodeURIComponent(orgId)}&from_date=${from}&to_date=${to}`;
     const attempts: string[] = [
       `${base}&export_type=xlsx`,
       `${base}&export_format=xls`,
-      `${base}`, // often returns JSON
+      `${base}`, // JSON fallback
     ];
 
     let resp: Response | null = null, lastErr = '';
@@ -183,14 +160,11 @@ export async function POST(req: Request) {
       if (r.ok) { resp = r; break; }
       lastErr = await r.text().catch(() => '');
     }
-    if (!resp) {
-      return json(false, { error: 'Zoho TB request failed', detail: lastErr.slice(0, 1200), tried: attempts }, 400);
-    }
+    if (!resp) return json(false, { error: 'Zoho TB request failed', detail: lastErr.slice(0, 1200), tried: attempts }, 400);
 
-    // Read payload & detect type
     const buf = Buffer.from(await resp.arrayBuffer());
-    const ct = resp.headers.get('content-type');
-    const cd = resp.headers.get('content-disposition');
+    const ct = resp.headers.get('content-type') || '';
+    const cd = resp.headers.get('content-disposition') || '';
     const guess = guessExtMime(buf, ct, cd);
 
     let uploadBuf = buf;
@@ -198,49 +172,14 @@ export async function POST(req: Request) {
     let uploadMime = guess.mime;
     let convertedFromJson = false;
 
-    // If JSON → build a proper XLSX using deep extraction
+    // JSON detection (also handles BOM)
+    const textHead = buf.toString('utf8', 0, Math.min(buf.length, 128));
     const looksJson =
       uploadExt === 'json' ||
-      (ct && ct.toLowerCase().includes('json')) ||
-      /^[\s\r\n]*[\{\[]/.test(buf.toString('utf8', 0, Math.min(buf.length, 64)));
+      ct.toLowerCase().includes('json') ||
+      /^[\uFEFF\s\r\n]*[\{\[]/.test(textHead);
 
-    if (looksJson) {
-      try {
-        const text = buf.toString('utf8');
-        const jsonBody = JSON.parse(text);
-
-        const tables = extractTablesFromZohoDeep(jsonBody);
-        if (!tables.length) {
-          return json(false, {
-            error: 'Zoho JSON returned but no table-like data found',
-            previewKeys: Object.keys(jsonBody).slice(0, 30),
-          }, 422);
-        }
-
-        const XLSXmod: any = await import('xlsx');
-        const XLSX = XLSXmod?.default ?? XLSXmod;
-
-        const wb = XLSX.utils.book_new();
-        const TOP = tables.slice(0, 6); // cap number of sheets
-        TOP.forEach((t, idx) => {
-          const ws = XLSX.utils.json_to_sheet(t.rows);
-          let name = t.name;
-          const low = name.toLowerCase();
-          if (low.includes('values')) name = 'TrialBalance';
-          else if (low.includes('rows')) name = 'TrialBalanceRows';
-          XLSX.utils.book_append_sheet(wb, ws, (name || `Sheet${idx + 1}`).slice(0, 31));
-        });
-
-        uploadBuf  = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
-        uploadExt  = 'xlsx';
-        uploadMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
-        convertedFromJson = true;
-      } catch (e: any) {
-        return json(false, { error: 'Failed to convert Zoho JSON to XLSX', detail: String(e?.message || e) }, 500);
-      }
-    }
-
-    // Upload to Google Drive (Shared drives OK)
+    // prepare Drive (also used for debug upload)
     const { google } = await import('googleapis');
     const sa = JSON.parse(String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}'));
     const auth = new google.auth.JWT({
@@ -249,9 +188,79 @@ export async function POST(req: Request) {
       scopes: ['https://www.googleapis.com/auth/drive.file'],
     });
     const drive = google.drive({ version: 'v3', auth });
-
     const parent = String(process.env.GOOGLE_DRIVE_PARENT_ID || '');
     if (!parent) return json(false, { error: 'Missing GOOGLE_DRIVE_PARENT_ID' }, 500);
+
+    if (looksJson) {
+      const rawText = buf.toString('utf8').replace(/^\uFEFF/, ''); // strip BOM
+      let jsonBody: any;
+      try {
+        jsonBody = JSON.parse(rawText);
+      } catch (e: any) {
+        // Upload raw JSON (debug) and return parse error
+        let debugUpload;
+        if (debug) {
+          const dbg = await drive.files.create({
+            requestBody: { name: `TB_${REGION}_${from.slice(0,7)}_RAW.json`, parents: [parent] },
+            media: { mimeType: 'application/json', body: Readable.from(Buffer.from(rawText, 'utf8')) },
+            fields: 'id, webViewLink, name',
+            supportsAllDrives: true,
+          } as any);
+          debugUpload = dbg.data;
+        }
+        return json(false, {
+          error: 'Zoho JSON parse failed',
+          parseError: String(e?.message || e),
+          head: rawText.slice(0, 500),
+          contentType: ct,
+          debugFile: debugUpload,
+        }, 422);
+      }
+
+      // if Zoho returned an error JSON, surface it
+      if (jsonBody?.code && jsonBody?.message && !jsonBody?.trialbalance && !jsonBody?.data) {
+        return json(false, { error: 'Zoho error', zoho: { code: jsonBody.code, message: jsonBody.message } }, 400);
+      }
+
+      const tables = extractTablesFromZohoDeep(jsonBody);
+      if (!tables.length) {
+        // Upload raw (debug) so we can inspect structure
+        let debugUpload;
+        if (debug) {
+          const dbg = await drive.files.create({
+            requestBody: { name: `TB_${REGION}_${from.slice(0,7)}_RAW.json`, parents: [parent] },
+            media: { mimeType: 'application/json', body: Readable.from(Buffer.from(JSON.stringify(jsonBody, null, 2))) },
+            fields: 'id, webViewLink, name',
+            supportsAllDrives: true,
+          } as any);
+          debugUpload = dbg.data;
+        }
+        return json(false, {
+          error: 'Zoho JSON returned but no table-like data found',
+          previewKeys: Object.keys(jsonBody).slice(0, 30),
+          debugFile: debugUpload,
+        }, 422);
+      }
+
+      const XLSXmod: any = await import('xlsx');
+      const XLSX = XLSXmod?.default ?? XLSXmod;
+
+      const wb = XLSX.utils.book_new();
+      const TOP = tables.slice(0, 6);
+      TOP.forEach((t, idx) => {
+        const ws = XLSX.utils.json_to_sheet(t.rows);
+        let name = t.name;
+        const low = name.toLowerCase();
+        if (low.includes('values')) name = 'TrialBalance';
+        else if (low.includes('rows')) name = 'TrialBalanceRows';
+        XLSX.utils.book_append_sheet(wb, ws, (name || `Sheet${idx + 1}`).slice(0, 31));
+      });
+
+      uploadBuf  = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+      uploadExt  = 'xlsx';
+      uploadMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+      convertedFromJson = true;
+    }
 
     const fileName = `TB_${REGION}_${from.slice(0,7)}.${uploadExt}`;
     const stream = Readable.from(uploadBuf);
