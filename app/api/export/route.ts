@@ -292,7 +292,8 @@ export async function POST(req: Request) {
     } as any);
 
     /* 2) Build XLSX (convert when needed) */
-    let xlsxBuf: Buffer;
+    let xlsxBuf: Buffer = Buffer.alloc(0); // initialize to empty buffer
+
 
     if (looksJson) {
       // JSON → tables → XLSX
@@ -390,6 +391,20 @@ export async function POST(req: Request) {
       XLSX.utils.book_append_sheet(wb, ws, 'Info');
       xlsxBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
     }
+
+// Fallback: if xlsxBuf never got content (TypeScript “used before assigned” guard)
+if (!xlsxBuf || xlsxBuf.length === 0) {
+  const XLSXmod: any = await import('xlsx');
+  const XLSX = XLSXmod?.default ?? XLSXmod;
+  const ws = XLSX.utils.aoa_to_sheet([
+    ['No XLSX content was produced from the Zoho response.'],
+    ['sourceType', (looksJson ? 'json' : rawGuess.ext)],
+    ['note', 'This is a safety fallback to satisfy the upload.'],
+  ]);
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, 'Info');
+  xlsxBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+}
 
     const xlsxName = `TB_${REGION}_${period}.xlsx`;
     const xlsxUpload = await drive.files.create({
