@@ -53,6 +53,123 @@ function guessExtMime(buf: Buffer, ct?: string | null, cd?: string | null): { ex
   return { ext: 'json', mime: 'application/json' };
 }
 
+/** ---- TB flattening helpers ---- */
+type TBRow = {
+  section: string;
+  account_id: string | null;
+  account_code: string;
+  account_name: string | null;
+  depth: number | null;
+  is_child_present: boolean | null;
+  net_debit_total: number | null;
+  net_credit_total: number | null;
+  opening_debit?: number | null;
+  opening_credit?: number | null;
+  period_debit?: number | null;
+  period_credit?: number | null;
+  closing_debit?: number | null;
+  closing_credit?: number | null;
+  codes_enabled_in_section?: boolean;
+};
+
+function toNum(x: any): number | null {
+  if (x === '' || x === null || x === undefined) return null;
+  const n = Number(x);
+  return Number.isFinite(n) ? n : null;
+}
+
+function flattenZohoTrialBalance(tbJson: any): TBRow[] {
+  // Expected Zoho Books TB JSON shape:
+  // { code, message, trialbalance: [ { account_transactions: [ {name:'Assets', account_transactions:[...]} ] } ] }
+  const sections = tbJson?.trialbalance?.[0]?.account_transactions;
+  if (!Array.isArray(sections)) return [];
+
+  const rows: TBRow[] = [];
+
+  for (const section of sections) {
+    const sectionName = section?.name ?? '';
+    const codesEnabled = !!section?.is_account_code_column_enabled;
+
+    const accounts: any[] = section?.account_transactions ?? [];
+    for (const acc of accounts) {
+      const vals = Array.isArray(acc?.values) && acc.values.length ? acc.values[0] : {};
+
+      rows.push({
+        section: String(sectionName),
+        account_id: acc?.account_id ?? null,
+        account_code: String((acc?.account_code ?? '')).trim(),
+        account_name: acc?.name ?? null,
+        depth: typeof acc?.depth === 'number' ? acc.depth : null,
+        is_child_present: typeof acc?.is_child_present === 'boolean' ? acc.is_child_present : null,
+
+        // Prefer inner values[...] if present; fall back to top-level fields
+        net_debit_total: toNum(vals?.net_debit_total ?? acc?.net_debit_total),
+        net_credit_total: toNum(vals?.net_credit_total ?? acc?.net_credit_total),
+
+        // Optional fields if the org/report includes them
+        opening_debit: toNum(vals?.opening_debit_total),
+        opening_credit: toNum(vals?.opening_credit_total),
+        period_debit: toNum(vals?.debit_total),
+        period_credit: toNum(vals?.credit_total),
+        closing_debit: toNum(vals?.closing_debit_total),
+        closing_credit: toNum(vals?.closing_credit_total),
+
+        codes_enabled_in_section: codesEnabled,
+      });
+    }
+  }
+  return rows;
+}
+
+function csvEscape(s: any): string {
+  if (s === null || s === undefined) return '';
+  const str = String(s);
+  return /[",\n]/.test(str) ? `"${str.replace(/"/g, '""')}"` : str;
+}
+
+function rowsToCSV(rows: TBRow[]): string {
+  const headers = [
+    'section',
+    'account_id',
+    'account_code',
+    'account_name',
+    'depth',
+    'is_child_present',
+    'net_debit_total',
+    'net_credit_total',
+    'opening_debit',
+    'opening_credit',
+    'period_debit',
+    'period_credit',
+    'closing_debit',
+    'closing_credit',
+    'codes_enabled_in_section',
+  ];
+  const lines = [headers.join(',')];
+  for (const r of rows) {
+    const line = [
+      r.section,
+      r.account_id,
+      r.account_code,
+      r.account_name,
+      r.depth,
+      r.is_child_present,
+      r.net_debit_total,
+      r.net_credit_total,
+      r.opening_debit,
+      r.opening_credit,
+      r.period_debit,
+      r.period_credit,
+      r.closing_debit,
+      r.closing_credit,
+      r.codes_enabled_in_section,
+    ].map(csvEscape).join(',');
+    lines.push(line);
+  }
+  // Normalize line endings to CRLF for Excel friendliness
+  return lines.join('\r\n');
+}
+
 export async function POST(req: Request) {
   try {
     const body = await req.json().catch(() => ({}));
@@ -169,7 +286,41 @@ export async function POST(req: Request) {
       supportsAllDrives: true,
     } as any);
 
-    // 6) Return only metadata about the RAW file
+    // ---- STEP E: fetch JSON (no export_type), flatten, upload CSV ----
+    let extracted: any = null;
+    try {
+      const jsonRes = await fetch(base, { headers: authHeaders });
+      if (jsonRes.ok) {
+        const tbJson = await jsonRes.json();
+        const rows = flattenZohoTrialBalance(tbJson);
+        const csv = rowsToCSV(rows);
+
+        const csvName = `TB_${REGION}_${period}_Extract.csv`;
+        const csvUpload = await drive.files.create({
+          requestBody: { name: csvName, parents: [parent] },
+          media: { mimeType: 'text/csv', body: Readable.from(Buffer.from(csv, 'utf8')) },
+          fields: 'id, name, mimeType, webViewLink, size',
+          supportsAllDrives: true,
+        } as any);
+
+        extracted = {
+          id: csvUpload.data.id,
+          name: csvUpload.data.name,
+          webViewLink: csvUpload.data.webViewLink,
+          mimeType: csvUpload.data.mimeType,
+          size: csvUpload.data.size,
+          rows: rows.length,
+          accounts_with_code: rows.filter(r => r.account_code && r.account_code !== '').length,
+          accounts_without_code: rows.filter(r => !r.account_code).length,
+        };
+      } else {
+        extracted = { error: 'JSON fetch failed', status: jsonRes.status, statusText: jsonRes.statusText };
+      }
+    } catch (e: any) {
+      extracted = { error: 'Extraction error', detail: String(e?.message || e) };
+    }
+
+    // 6) Return metadata for both files
     return j(true, {
       raw: {
         id: upload.data.id,
@@ -179,6 +330,7 @@ export async function POST(req: Request) {
         fileExtension: upload.data.fileExtension ?? ext,
         size: upload.data.size ?? buf.length,
       },
+      extracted, // <-- flattened CSV meta (or error details)
       detect: {
         guessedExt: ext,
         guessedMime: mime,
