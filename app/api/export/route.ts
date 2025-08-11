@@ -10,7 +10,7 @@ function json(ok: boolean, body: any, status = 200) {
   return NextResponse.json({ ok, ...body }, { status });
 }
 
-type Guess = { ext: 'xlsx' | 'xls' | 'csv' | 'pdf'; mime: string };
+type Guess = { ext: 'xlsx' | 'xls' | 'csv' | 'pdf' | 'json'; mime: string };
 
 function guessExtMime(buf: Buffer, contentType?: string | null, contentDisp?: string | null): Guess {
   // 1) filename hint
@@ -21,6 +21,7 @@ function guessExtMime(buf: Buffer, contentType?: string | null, contentDisp?: st
     if (filename.endsWith('.xls'))  return { ext: 'xls',  mime: 'application/vnd.ms-excel' };
     if (filename.endsWith('.csv'))  return { ext: 'csv',  mime: 'text/csv' };
     if (filename.endsWith('.pdf'))  return { ext: 'pdf',  mime: 'application/pdf' };
+    if (filename.endsWith('.json')) return { ext: 'json', mime: 'application/json' };
   }
   // 2) content-type
   if (contentType) {
@@ -29,6 +30,7 @@ function guessExtMime(buf: Buffer, contentType?: string | null, contentDisp?: st
     if (ct.includes('vnd.ms-excel'))                        return { ext: 'xls',  mime: 'application/vnd.ms-excel' };
     if (ct.includes('text/csv') || ct.includes('application/csv')) return { ext: 'csv', mime: 'text/csv' };
     if (ct.includes('pdf'))                                 return { ext: 'pdf',  mime: 'application/pdf' };
+    if (ct.includes('json'))                                return { ext: 'json', mime: 'application/json' };
   }
   // 3) magic bytes
   const b = buf;
@@ -46,7 +48,48 @@ function guessExtMime(buf: Buffer, contentType?: string | null, contentDisp?: st
     return { ext: 'pdf', mime: 'application/pdf' };
   }
   // Fallback
-  return { ext: 'csv', mime: 'text/csv' };
+  return { ext: 'json', mime: 'application/json' };
+}
+
+// Try to find a table-like array of objects inside Zoho's JSON
+function extractTablesFromZoho(json: any): Array<{name: string, rows: any[]}> {
+  const tables: Array<{name: string, rows: any[]}> = [];
+
+  // Direct array of objects
+  if (Array.isArray(json) && json.length && typeof json[0] === 'object') {
+    tables.push({ name: 'Sheet1', rows: json });
+    return tables;
+  }
+
+  // Common keys to look for
+  const keys = ['trialbalance', 'trial_balance', 'data', 'rows', 'report', 'result', 'items', 'records'];
+  for (const k of Object.keys(json)) {
+    const v = (json as any)[k];
+    if (Array.isArray(v) && v.length && typeof v[0] === 'object') {
+      tables.push({ name: k.slice(0, 31), rows: v });
+    } else if (v && typeof v === 'object') {
+      // look one level deeper
+      for (const kk of keys) {
+        const vv = (v as any)[kk];
+        if (Array.isArray(vv) && vv.length && typeof vv[0] === 'object') {
+          tables.push({ name: `${k}_${kk}`.slice(0, 31), rows: vv });
+        }
+      }
+    }
+  }
+
+  // As a last resort, if we see {columns:[..], rows:[[..]]}, map columns -> objects
+  const cols = (json?.columns || json?.report?.columns || json?.table?.columns) as any[];
+  const rws  = (json?.rows    || json?.report?.rows    || json?.table?.rows) as any[];
+  if (Array.isArray(cols) && Array.isArray(rws) && cols.length && rws.length) {
+    const headers = cols.map((c: any) => (c?.name || c?.label || c)?.toString?.() || 'col');
+    const mapped = rws
+      .filter((row: any) => Array.isArray(row))
+      .map((row: any[]) => Object.fromEntries(headers.map((h: string, i: number) => [h, row[i]])));
+    if (mapped.length) tables.push({ name: 'Report', rows: mapped });
+  }
+
+  return tables;
 }
 
 export async function POST(req: Request) {
@@ -60,10 +103,10 @@ export async function POST(req: Request) {
       return json(false, { error: 'Dates must be YYYY-MM-DD' }, 400);
     }
 
-    // temporary: single app user
+    // single-user for now
     const USER_EMAIL = 'owner@ultrahuman.com';
 
-    // Get refresh token
+    // get refresh token
     const row = await pool.query(
       `select refresh_token_enc from zoho_connections
        where user_email=$1 and region_key=$2 limit 1`,
@@ -74,7 +117,7 @@ export async function POST(req: Request) {
     const sealed = typeof sealedRaw === 'string' ? sealedRaw : Buffer.isBuffer(sealedRaw) ? sealedRaw.toString('utf8') : String(sealedRaw);
     const refreshToken = unseal(sealed);
 
-    // Exchange refresh -> access token
+    // refresh -> access token
     const { accounts, api, id, secret } = zohoClientFor(REGION as any);
     const tokenRes = await fetch(`${accounts}/oauth/v2/token`, {
       method: 'POST',
@@ -93,25 +136,13 @@ export async function POST(req: Request) {
     const accessToken = tokenJson.access_token as string;
     const headers = { Authorization: `Zoho-oauthtoken ${accessToken}` };
 
-    // Build attempts based on desired fmt
+    // Build attempts (Zoho can vary). We’ll request export first; if JSON comes back, we’ll transform.
     const base = `${api}/books/v3/reports/trialbalance?organization_id=${encodeURIComponent(orgId)}&from_date=${from}&to_date=${to}`;
-
-    const attempts: string[] = [];
-    if (fmt === 'csv') {
-      attempts.push(`${base}&export_format=csv`);
-      attempts.push(`${base}&export_type=csv`);
-      // fallbacks if csv not supported → xls/xlsx
-      attempts.push(`${base}&export_format=xls`);
-      attempts.push(`${base}&export_type=xlsx`);
-    } else if (fmt === 'xlsx') {
-      attempts.push(`${base}&export_type=xlsx`);
-      attempts.push(`${base}&export_format=xls`); // fallback
-    } else if (fmt === 'pdf') {
-      attempts.push(`${base}&export_type=pdf`);
-      attempts.push(`${base}&export_format=pdf`);
-    } else {
-      attempts.push(`${base}&export_type=${encodeURIComponent(String(fmt))}`);
-    }
+    const attempts: string[] = [
+      `${base}&export_type=xlsx`,
+      `${base}&export_format=xls`,
+      `${base}`, // plain JSON (no export param)
+    ];
 
     let resp: Response | null = null, lastErr = '';
     for (const url of attempts) {
@@ -120,13 +151,49 @@ export async function POST(req: Request) {
       lastErr = await r.text().catch(() => '');
     }
     if (!resp) {
-      return json(false, { error: 'Zoho TB export failed (all variants)', detail: lastErr.slice(0, 1200), tried: attempts }, 400);
+      return json(false, { error: 'Zoho TB request failed', detail: lastErr.slice(0, 1200), tried: attempts }, 400);
     }
 
+    // Read bytes and headers
     const buf = Buffer.from(await resp.arrayBuffer());
-    const guess = guessExtMime(buf, resp.headers.get('content-type'), resp.headers.get('content-disposition'));
+    const ct = resp.headers.get('content-type');
+    const cd = resp.headers.get('content-disposition');
+    const guess = guessExtMime(buf, ct, cd);
 
-    // Upload to Google Drive (Shared Drive)
+    let uploadBuf = buf;
+    let uploadExt = guess.ext;
+    let uploadMime = guess.mime;
+    let convertedFromJson = false;
+
+    // If Zoho responded with JSON, transform to XLSX
+    if (uploadExt === 'json' || (ct && ct.includes('json')) || /^[\s\r\n]*[\{\[]/.test(buf.toString('utf8', 0, Math.min(buf.length, 64)))) {
+      try {
+        const text = buf.toString('utf8');
+        const jsonBody = JSON.parse(text);
+
+        const tables = extractTablesFromZoho(jsonBody);
+        if (!tables.length) {
+          return json(false, { error: 'Zoho JSON returned but no table-like data found', previewKeys: Object.keys(jsonBody).slice(0, 20) }, 422);
+        }
+
+        const XLSXmod: any = await import('xlsx');
+        const XLSX = XLSXmod?.default ?? XLSXmod;
+
+        const wb = XLSX.utils.book_new();
+        for (const t of tables.slice(0, 6)) { // cap sheets to avoid huge workbooks
+          const sheet = XLSX.utils.json_to_sheet(t.rows);
+          XLSX.utils.book_append_sheet(wb, sheet, (t.name || 'Sheet').substring(0, 31));
+        }
+        uploadBuf = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+        uploadExt = 'xlsx';
+        uploadMime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+        convertedFromJson = true;
+      } catch (e: any) {
+        return json(false, { error: 'Failed to convert Zoho JSON to XLSX', detail: String(e?.message || e) }, 500);
+      }
+    }
+
+    // Upload to Google Drive (Shared Drive safe)
     const { google } = await import('googleapis');
     const sa = JSON.parse(String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}'));
     const auth = new google.auth.JWT({
@@ -139,12 +206,12 @@ export async function POST(req: Request) {
     const parent = String(process.env.GOOGLE_DRIVE_PARENT_ID || '');
     if (!parent) return json(false, { error: 'Missing GOOGLE_DRIVE_PARENT_ID' }, 500);
 
-    const fileName = `TB_${REGION}_${from.slice(0,7)}.${guess.ext}`;
-    const stream = Readable.from(buf);
+    const fileName = `TB_${REGION}_${from.slice(0,7)}.${uploadExt}`;
+    const stream = Readable.from(uploadBuf);
 
     const g = await drive.files.create({
       requestBody: { name: fileName, parents: [parent] },
-      media: { mimeType: guess.mime, body: stream },
+      media: { mimeType: uploadMime, body: stream },
       fields: 'id, name, mimeType, fileExtension, webViewLink, parents',
       supportsAllDrives: true,
     } as any);
@@ -155,8 +222,8 @@ export async function POST(req: Request) {
       mimeType: g.data.mimeType,
       fileExtension: g.data.fileExtension,
       webViewLink: g.data.webViewLink,
-      chosenFmt: fmt,
-      detectedFmt: guess.ext,
+      detectedResponse: guess.ext,
+      convertedFromJson,
     });
   } catch (e: any) {
     console.error('[export] error', e);
