@@ -1,3 +1,4 @@
+// app/api/export/route.ts
 export const runtime = 'nodejs';
 
 import { NextResponse } from 'next/server';
@@ -6,7 +7,7 @@ import { pool } from '@/lib/db';
 import { zohoClientFor } from '@/lib/zoho';
 import { unseal } from '@/lib/crypto';
 
-/* ---------------- helpers ---------------- */
+/* ---------------- small helpers ---------------- */
 
 function json(ok: boolean, body: any, status = 200) {
   return NextResponse.json({ ok, ...body }, { status });
@@ -33,19 +34,23 @@ function guessExtMime(buf: Buffer, contentType?: string | null, contentDisp?: st
     if (ct.includes('json'))                                return { ext: 'json', mime: 'application/json' };
   }
   const b = buf;
+  // XLSX ZIP
   if (b[0] === 0x50 && b[1] === 0x4b && b[2] === 0x03 && b[3] === 0x04) {
     return { ext: 'xlsx', mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' };
   }
-  if (b[0] === 0xd0 && b[1] === 0xcf && b[2] === 0x11 && b[3] === 0xe0 && b[4] === 0xa1 && b[5] === 0xb1 && b[6] === 0x1a && b[7] === 0xe1) {
+  // Legacy XLS OLE
+  if (b[0] === 0xd0 && b[1] === 0xcf && b[2] === 0x11 && b[3] === 0xe0 &&
+      b[4] === 0xa1 && b[5] === 0xb1 && b[6] === 0x1a && b[7] === 0xe1) {
     return { ext: 'xls', mime: 'application/vnd.ms-excel' };
   }
+  // PDF
   if (b[0] === 0x25 && b[1] === 0x50 && b[2] === 0x44 && b[3] === 0x46) {
     return { ext: 'pdf', mime: 'application/pdf' };
   }
   return { ext: 'json', mime: 'application/json' };
 }
 
-/* ---- deep JSON → tables with flattening ---- */
+/* ------ JSON → tables (deep search + flatten) ------ */
 
 type Table = { name: string; rows: any[]; size: number };
 
@@ -100,7 +105,32 @@ function extractTablesFromZohoDeep(json: any): Table[] {
   });
 }
 
-/* --------------------- handler --------------------- */
+/* ---- Excel sheet name sanitizing + de-duplication ---- */
+
+function sanitizeSheetName(raw: string) {
+  let name = (raw || 'Sheet')
+    .replace(/\[[^\]]*\]/g, '')        // remove bracket indexes
+    .replace(/[:\\/?*\[\]]/g, ' ')     // invalid Excel chars
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!name) name = 'Sheet';
+  return name.slice(0, 31);
+}
+function uniqueSheetName(seen: Set<string>, base: string) {
+  let name = sanitizeSheetName(base);
+  if (!seen.has(name)) { seen.add(name); return name; }
+  for (let i = 2; i < 100; i++) {
+    const suffix = ` (${i})`;
+    const head = name.slice(0, 31 - suffix.length);
+    const candidate = head + suffix;
+    if (!seen.has(candidate)) { seen.add(candidate); return candidate; }
+  }
+  const fallback = (name.slice(0, 20) + '_' + (Date.now() % 100000)).slice(0, 31);
+  seen.add(fallback);
+  return fallback;
+}
+
+/* ---------------------- handler ---------------------- */
 
 export async function POST(req: Request) {
   try {
@@ -116,8 +146,10 @@ export async function POST(req: Request) {
       return json(false, { error: 'Dates must be YYYY-MM-DD' }, 400);
     }
 
+    // single-user for now
     const USER_EMAIL = 'owner@ultrahuman.com';
 
+    // load sealed refresh token
     const row = await pool.query(
       `select refresh_token_enc from zoho_connections
        where user_email=$1 and region_key=$2 limit 1`,
@@ -129,6 +161,7 @@ export async function POST(req: Request) {
     const sealed = typeof sealedRaw === 'string' ? sealedRaw : Buffer.isBuffer(sealedRaw) ? sealedRaw.toString('utf8') : String(sealedRaw);
     const refreshToken = unseal(sealed);
 
+    // refresh → access token
     const { accounts, api, id, secret } = zohoClientFor(REGION as any);
     const tokenRes = await fetch(`${accounts}/oauth/v2/token`, {
       method: 'POST',
@@ -147,11 +180,12 @@ export async function POST(req: Request) {
     const accessToken = tokenJson.access_token as string;
     const headers = { Authorization: `Zoho-oauthtoken ${accessToken}` };
 
+    // Try export variants; fall back to raw JSON
     const base = `${api}/books/v3/reports/trialbalance?organization_id=${encodeURIComponent(orgId)}&from_date=${from}&to_date=${to}`;
     const attempts: string[] = [
       `${base}&export_type=xlsx`,
       `${base}&export_format=xls`,
-      `${base}`, // JSON fallback
+      `${base}`, // JSON
     ];
 
     let resp: Response | null = null, lastErr = '';
@@ -162,6 +196,7 @@ export async function POST(req: Request) {
     }
     if (!resp) return json(false, { error: 'Zoho TB request failed', detail: lastErr.slice(0, 1200), tried: attempts }, 400);
 
+    // read payload
     const buf = Buffer.from(await resp.arrayBuffer());
     const ct = resp.headers.get('content-type') || '';
     const cd = resp.headers.get('content-disposition') || '';
@@ -172,14 +207,14 @@ export async function POST(req: Request) {
     let uploadMime = guess.mime;
     let convertedFromJson = false;
 
-    // JSON detection (also handles BOM)
-    const textHead = buf.toString('utf8', 0, Math.min(buf.length, 128));
+    // JSON detection (with BOM-safe head check)
+    const head = buf.toString('utf8', 0, Math.min(buf.length, 128));
     const looksJson =
       uploadExt === 'json' ||
       ct.toLowerCase().includes('json') ||
-      /^[\uFEFF\s\r\n]*[\{\[]/.test(textHead);
+      /^[\uFEFF\s\r\n]*[\{\[]/.test(head);
 
-    // prepare Drive (also used for debug upload)
+    // prepare Drive
     const { google } = await import('googleapis');
     const sa = JSON.parse(String(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}'));
     const auth = new google.auth.JWT({
@@ -192,13 +227,12 @@ export async function POST(req: Request) {
     if (!parent) return json(false, { error: 'Missing GOOGLE_DRIVE_PARENT_ID' }, 500);
 
     if (looksJson) {
-      const rawText = buf.toString('utf8').replace(/^\uFEFF/, ''); // strip BOM
+      const rawText = buf.toString('utf8').replace(/^\uFEFF/, '');
       let jsonBody: any;
       try {
         jsonBody = JSON.parse(rawText);
       } catch (e: any) {
-        // Upload raw JSON (debug) and return parse error
-        let debugUpload;
+        let debugFile: any = null;
         if (debug) {
           const dbg = await drive.files.create({
             requestBody: { name: `TB_${REGION}_${from.slice(0,7)}_RAW.json`, parents: [parent] },
@@ -206,26 +240,18 @@ export async function POST(req: Request) {
             fields: 'id, webViewLink, name',
             supportsAllDrives: true,
           } as any);
-          debugUpload = dbg.data;
+          debugFile = dbg.data;
         }
-        return json(false, {
-          error: 'Zoho JSON parse failed',
-          parseError: String(e?.message || e),
-          head: rawText.slice(0, 500),
-          contentType: ct,
-          debugFile: debugUpload,
-        }, 422);
+        return json(false, { error: 'Zoho JSON parse failed', parseError: String(e?.message || e), head: rawText.slice(0, 500), contentType: ct, debugFile }, 422);
       }
 
-      // if Zoho returned an error JSON, surface it
       if (jsonBody?.code && jsonBody?.message && !jsonBody?.trialbalance && !jsonBody?.data) {
         return json(false, { error: 'Zoho error', zoho: { code: jsonBody.code, message: jsonBody.message } }, 400);
       }
 
       const tables = extractTablesFromZohoDeep(jsonBody);
       if (!tables.length) {
-        // Upload raw (debug) so we can inspect structure
-        let debugUpload;
+        let debugFile: any = null;
         if (debug) {
           const dbg = await drive.files.create({
             requestBody: { name: `TB_${REGION}_${from.slice(0,7)}_RAW.json`, parents: [parent] },
@@ -233,13 +259,9 @@ export async function POST(req: Request) {
             fields: 'id, webViewLink, name',
             supportsAllDrives: true,
           } as any);
-          debugUpload = dbg.data;
+          debugFile = dbg.data;
         }
-        return json(false, {
-          error: 'Zoho JSON returned but no table-like data found',
-          previewKeys: Object.keys(jsonBody).slice(0, 30),
-          debugFile: debugUpload,
-        }, 422);
+        return json(false, { error: 'Zoho JSON returned but no table-like data found', previewKeys: Object.keys(jsonBody).slice(0, 30), debugFile }, 422);
       }
 
       const XLSXmod: any = await import('xlsx');
@@ -247,13 +269,18 @@ export async function POST(req: Request) {
 
       const wb = XLSX.utils.book_new();
       const TOP = tables.slice(0, 6);
+      const seen = new Set<string>();
+
       TOP.forEach((t, idx) => {
         const ws = XLSX.utils.json_to_sheet(t.rows);
-        let name = t.name;
-        const low = name.toLowerCase();
-        if (low.includes('values')) name = 'TrialBalance';
-        else if (low.includes('rows')) name = 'TrialBalanceRows';
-        XLSX.utils.book_append_sheet(wb, ws, (name || `Sheet${idx + 1}`).slice(0, 31));
+        // friendly base names
+        let base = t.name || `Sheet${idx + 1}`;
+        const low = base.toLowerCase();
+        if (low.includes('values')) base = 'Trial Balance';
+        else if (low.includes('rows')) base = 'Trial Balance Rows';
+        // unique + sanitized
+        const safe = uniqueSheetName(seen, base);
+        XLSX.utils.book_append_sheet(wb, ws, safe);
       });
 
       uploadBuf  = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
